@@ -3,12 +3,12 @@ import express from "express";
 import mongoose from "mongoose";
 import cors from "cors";
 import dotenv from "dotenv";
-import fetch from 'node-fetch';
+import fetch from 'node-fetch'; // Certifique-se que está usando node-fetch v2 se estiver com CommonJS ou configure para v3 com ESM
 import session from 'express-session';
 import passport from 'passport';
 import { Strategy as DiscordStrategy } from 'passport-discord';
 
-dotenv.config(); // Carrega variáveis de ambiente do .env
+dotenv.config();
 
 // --- VERIFICAÇÕES CRÍTICAS DE VARIÁVEIS DE AMBIENTE ---
 if (!process.env.MONGO_URI) {
@@ -17,7 +17,6 @@ if (!process.env.MONGO_URI) {
 }
 if (!process.env.DISCORD_BOT_TOKEN) {
     console.warn("AVISO: DISCORD_BOT_TOKEN não definido no .env. A busca de usuários ao vivo no Discord pode não funcionar.");
-    // Não sair, pois a API pode funcionar para usuários já no DB
 }
 if (!process.env.DISCORD_CLIENT_ID || !process.env.DISCORD_CLIENT_SECRET || !process.env.CALLBACK_URL) {
   console.error("ERRO CRÍTICO: Variáveis de ambiente para OAuth2 do Discord (DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, CALLBACK_URL) não estão completamente definidas. A aplicação não pode iniciar.");
@@ -39,13 +38,12 @@ if (!process.env.FRONTEND_CORS_ORIGIN) {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Configuração de CORS
 app.use(cors({
-  origin: process.env.FRONTEND_CORS_ORIGIN, // Ex: https://jesusdiscordjs.github.io
+  origin: process.env.FRONTEND_CORS_ORIGIN,
   credentials: true
 }));
 
-app.set('trust proxy', 1); // Essencial para secure cookies atrás de um proxy como o do Render
+app.set('trust proxy', 1);
 
 app.use(session({
   secret: process.env.SESSION_SECRET,
@@ -53,30 +51,33 @@ app.use(session({
   saveUninitialized: false,
   cookie: {
     maxAge: 1000 * 60 * 60 * 24 * 7, // 7 dias
-    secure: true, // Requer HTTPS. Essencial para SameSite=None. Render fornece HTTPS.
+    secure: true,
     httpOnly: true,
-    sameSite: 'none' // Necessário para cookies de sessão cross-site
+    sameSite: 'none'
   }
 }));
 
 app.use(passport.initialize());
 app.use(passport.session());
 
-passport.serializeUser((user, done) => {
-  done(null, user);
+// MODIFICADO: Armazenar accessToken e profile na sessão
+passport.serializeUser((userData, done) => { // userData agora será { accessToken, profile }
+  done(null, userData);
 });
 
-passport.deserializeUser((user, done) => {
-  done(null, user);
+passport.deserializeUser((userData, done) => { // userData é { accessToken, profile }
+  done(null, userData);
 });
 
 passport.use(new DiscordStrategy({
   clientID: process.env.DISCORD_CLIENT_ID,
   clientSecret: process.env.DISCORD_CLIENT_SECRET,
-  callbackURL: process.env.CALLBACK_URL, // Ex: https://sua-api.onrender.com/auth/discord/callback
-  scope: ['identify', 'email', 'guilds']
+  callbackURL: process.env.CALLBACK_URL,
+  // MODIFICADO: Adicionado 'relationships.read' ao escopo
+  scope: ['identify', 'email', 'guilds', 'relationships.read']
 }, (accessToken, refreshToken, profile, done) => {
-  return done(null, profile);
+  // MODIFICADO: Passar accessToken junto com o profile para ser salvo na sessão
+  return done(null, { accessToken, profile });
 }));
 
 mongoose.connect(process.env.MONGO_URI, { dbName: "discordAvatares" })
@@ -103,14 +104,11 @@ const isAuth = (req, res, next) => {
 };
 
 // --- ROTAS DE AUTENTICAÇÃO ---
-app.get('/auth/discord', passport.authenticate('discord'));
+app.get('/auth/discord', passport.authenticate('discord')); // O escopo já está definido na Strategy
 
 app.get('/auth/discord/callback', passport.authenticate('discord', {
-  // Garanta que FRONTEND_LOGIN_URL está definida e é uma URL absoluta
   failureRedirect: `${process.env.FRONTEND_LOGIN_URL}?error=auth_failed`
 }), (req, res) => {
-  // Garanta que FRONTEND_DASHBOARD_URL está definida e é uma URL absoluta
-  // O '|| \'\'' foi removido pois agora temos uma verificação no início que garante que a variável existe.
   res.redirect(process.env.FRONTEND_DASHBOARD_URL);
 });
 
@@ -120,22 +118,70 @@ app.get('/auth/logout', (req, res, next) => {
     req.session.destroy((err) => {
       if (err) return next(err);
       res.clearCookie('connect.sid', { path: '/', sameSite: 'none', secure: true });
-      // Garanta que FRONTEND_LOGIN_URL está definida
       res.status(200).json({ message: "Logout bem-sucedido", redirectTo: process.env.FRONTEND_LOGIN_URL });
     });
   });
 });
 
+// MODIFICADO: /api/me para usar req.user.profile
 app.get('/api/me', isAuth, (req, res) => {
+  if (!req.user || !req.user.profile) {
+    return res.status(500).json({ error: "Dados de usuário incompletos na sessão." });
+  }
+  const profile = req.user.profile;
   res.json({
-    id: req.user.id,
-    username: req.user.username,
-    avatar: req.user.avatar,
-    discriminator: req.user.discriminator
+    id: profile.id,
+    username: profile.username,
+    avatar: profile.avatar,
+    discriminator: profile.discriminator
   });
 });
 
+// NOVO: Endpoint para buscar amigos do Discord
+app.get('/api/me/friends', isAuth, async (req, res) => {
+  if (!req.user || !req.user.accessToken) {
+    return res.status(401).json({ error: "Access token não encontrado. Por favor, refaça o login." });
+  }
+
+  try {
+    const discordApiUrl = `https://discord.com/api/v10/users/@me/relationships`;
+    const response = await fetch(discordApiUrl, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${req.user.accessToken}`,
+        'User-Agent': 'CelestialUserTrackerAPI/1.0 (Friends Feature)'
+      }
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ message: response.statusText }));
+      console.error(`Erro ao buscar amigos do Discord para usuário ${req.user.profile.id}: ${response.status}`, errorData);
+      return res.status(response.status).json({ error: `Erro ao buscar amigos do Discord: ${errorData.message || response.statusText}` });
+    }
+
+    const relationships = await response.json();
+    // Filtrar apenas amigos (type: 1)
+    const friends = relationships
+      .filter(rel => rel.type === 1) // Type 1 significa amigo
+      .map(friendRel => ({
+        id: friendRel.id, // ID do amigo
+        username: friendRel.user.username,
+        discriminator: friendRel.user.discriminator,
+        avatar: friendRel.user.avatar
+        // Adicione mais campos de friendRel.user se necessário
+      }));
+
+    res.json(friends);
+
+  } catch (error) {
+    console.error(`Erro interno ao buscar amigos para ${req.user.profile.id}:`, error);
+    res.status(500).json({ error: "Erro interno ao processar a lista de amigos." });
+  }
+});
+
+
 // --- ROTA DA API DO TRACKER (Protegida) ---
+// (A rota /api/avatars/:id permanece a mesma, não precisa de modificação para esta feature)
 app.get("/api/avatars/:id", isAuth, async (req, res) => {
   try {
     const requestedUserId = req.params.id;
@@ -144,7 +190,7 @@ app.get("/api/avatars/:id", isAuth, async (req, res) => {
     }
     let userFromDb = await AvatarModel.findOne({ userId: requestedUserId });
     if (!userFromDb) {
-      if (!process.env.DISCORD_BOT_TOKEN) { // Verifica se o token do bot existe para busca ao vivo
+      if (!process.env.DISCORD_BOT_TOKEN) {
         return res.status(404).json({ error: "Usuário não encontrado no banco de dados e a busca ao vivo no Discord está desabilitada (token do bot não configurado)." });
       }
       const discordApiUrl = `https://discord.com/api/v10/users/${requestedUserId}`;
@@ -188,15 +234,11 @@ app.get('/', (req, res) => {
 });
 
 // --- TRATAMENTO DE ERROS ---
-// Handler para rotas não encontradas (404)
 app.use((req, res, next) => {
   res.status(404).json({ error: "Endpoint da API não encontrado." });
 });
-
-// Handler para erros gerais (500)
 app.use((err, req, res, next) => {
   console.error("Erro não tratado no servidor:", err.stack || err);
-  // Evita enviar nova resposta se uma já foi enviada (ex: por um erro dentro de um stream)
   if (!res.headersSent) {
     res.status(500).json({ error: 'Ocorreu um erro inesperado na API.' });
   }
