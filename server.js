@@ -3,95 +3,174 @@ import express from "express";
 import mongoose from "mongoose";
 import cors from "cors";
 import dotenv from "dotenv";
-import fetch from 'node-fetch'; // Para fazer requisições HTTP à API do Discord
+import fetch from 'node-fetch';
+import session from 'express-session';
+import passport from 'passport';
+import { Strategy as DiscordStrategy } from 'passport-discord';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-dotenv.config(); // Carrega variáveis de ambiente do arquivo .env
+// Configuração para __dirname em ES Modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
+dotenv.config();
+
+// --- CONFIGURAÇÃO DO APP E VARIÁVEIS ---
 const app = express();
-const PORT = process.env.PORT || 3000; // Porta do servidor
-const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN; // Token do seu bot Discord
-const MONGO_URI = process.env.MONGO_URI; // String de conexão do MongoDB
+const PORT = process.env.PORT || 3000;
 
-app.use(cors()); // Habilita CORS para todas as rotas
+const frontendUrl = process.env.FRONTEND_URL || `http://localhost:${PORT}`; // Para CORS, se necessário no futuro
 
-// Conectar ao MongoDB
-if (!MONGO_URI) {
-  console.error("ERRO: MONGO_URI não definida no .env. A aplicação não pode iniciar.");
-  process.exit(1); // Encerra a aplicação se a URI do MongoDB não estiver definida
+app.use(cors({
+  origin: frontendUrl, // Ajuste se o frontend estiver em um domínio totalmente separado
+  credentials: true
+}));
+
+// --- SESSÃO E AUTENTICAÇÃO (PASSPORT) ---
+if (!process.env.SESSION_SECRET) {
+  console.error("ERRO: SESSION_SECRET não definida no .env. A aplicação não pode iniciar com segurança.");
+  process.exit(1);
+}
+app.use(session({
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    maxAge: 1000 * 60 * 60 * 24 * 7 // 7 dias de sessão
+    // secure: process.env.NODE_ENV === 'production', // Use true em produção com HTTPS
+    // httpOnly: true,
+    // sameSite: 'lax' // ou 'strict'
+  }
+  // Para produção, considere usar um session store persistente como connect-mongo
+}));
+
+app.use(passport.initialize());
+app.use(passport.session());
+
+passport.serializeUser((user, done) => {
+  // 'user' aqui é o 'profile' retornado pela DiscordStrategy
+  done(null, user); // Salva o perfil completo do Discord na sessão
+});
+
+passport.deserializeUser(async (user, done) => {
+  // 'user' aqui é o perfil completo que foi salvo na sessão
+  // Não precisamos buscar na API do Discord novamente a cada request se já temos o perfil
+  done(null, user);
+});
+
+
+if (!process.env.DISCORD_CLIENT_ID || !process.env.DISCORD_CLIENT_SECRET || !process.env.CALLBACK_URL) {
+  console.error("ERRO: Variáveis de ambiente para OAuth2 do Discord (CLIENT_ID, CLIENT_SECRET, CALLBACK_URL) não estão completamente definidas.");
+  // Considere não iniciar o app ou desabilitar as rotas de auth
 }
 
-mongoose.connect(MONGO_URI, {
-  dbName: "discordAvatares", // Nome do banco de dados
-}).then(() => console.log("✅ MongoDB conectado com sucesso!"))
+passport.use(new DiscordStrategy({
+  clientID: process.env.DISCORD_CLIENT_ID,
+  clientSecret: process.env.DISCORD_CLIENT_SECRET,
+  callbackURL: process.env.CALLBACK_URL,
+  scope: ['identify', 'email', 'guilds'] // Escopos comuns: identify (obrigatório), email, guilds
+}, (accessToken, refreshToken, profile, done) => {
+  // 'profile' contém os dados do usuário do Discord.
+  // profile.id, profile.username, profile.discriminator, profile.avatar, profile.email, profile.guilds etc.
+  // Você poderia verificar/salvar/atualizar o usuário no seu DB aqui se necessário.
+  // Por exemplo, para associar o login do Discord a um usuário interno do seu sistema.
+  // Para este tracker, o perfil do Discord na sessão é suficiente por enquanto.
+  return done(null, profile); // Passa o perfil para serializeUser
+}));
+
+// --- CONEXÃO COM MONGODB ---
+if (!process.env.MONGO_URI) {
+  console.error("ERRO: MONGO_URI não definida no .env. A aplicação não pode iniciar.");
+  process.exit(1);
+}
+mongoose.connect(process.env.MONGO_URI, { dbName: "discordAvatares" })
+  .then(() => console.log("✅ MongoDB conectado com sucesso!"))
   .catch((err) => {
     console.error("❌ Erro ao conectar ao MongoDB:", err);
-    process.exit(1); // Encerra em caso de falha na conexão inicial com o DB
+    process.exit(1);
   });
 
-// Schema completo do usuário/avatar no MongoDB
+// --- SCHEMAS E MODELOS ---
 const avatarSchema = new mongoose.Schema({
-  userId: { type: String, index: true, unique: true, required: true }, // ID do usuário, indexado e único
-  usernames: { type: [String], default: [] }, // Histórico de nomes de usuário
-  avatars: { type: [String], default: [] },   // Histórico de URLs de avatares
-  lastJoinCall: { // Última vez que entrou em um canal de voz
-    channelId: String,
-    timestamp: Date,
-  },
-  lastLeaveCall: { // Última vez que saiu de um canal de voz
-    channelId: String,
-    timestamp: Date,
-  },
-}, { timestamps: true }); // Adiciona createdAt e updatedAt automaticamente
-
-// "Avatar" é o nome do modelo, mapeando para a coleção "avatars" (pluralizado) no MongoDB.
+  userId: { type: String, index: true, unique: true, required: true },
+  usernames: { type: [String], default: [] },
+  avatars: { type: [String], default: [] },
+  lastJoinCall: { channelId: String, timestamp: Date },
+  lastLeaveCall: { channelId: String, timestamp: Date },
+}, { timestamps: true });
 const AvatarModel = mongoose.model("Avatar", avatarSchema);
 
-// Rota principal da API para buscar dados do usuário por ID
-app.get("/api/avatars/:id", async (req, res) => {
+// --- MIDDLEWARE DE AUTENTICAÇÃO ---
+const isAuth = (req, res, next) => {
+  if (req.isAuthenticated()) { // passport adiciona isAuthenticated() ao objeto req
+    return next();
+  }
+  res.status(401).json({ error: "Não autorizado. Por favor, faça login." });
+};
+
+// --- ROTAS DE AUTENTICAÇÃO ---
+app.get('/auth/discord', passport.authenticate('discord')); // Inicia o fluxo OAuth2
+
+app.get('/auth/discord/callback', passport.authenticate('discord', {
+  failureRedirect: '/?error=authfailed' // Redireciona para a pág. de login com erro
+}), (req, res) => {
+  // Sucesso na autenticação
+  res.redirect('/dashboard.html'); // Redireciona para a dashboard
+});
+
+app.get('/auth/logout', (req, res, next) => {
+  req.logout((err) => {
+    if (err) { return next(err); }
+    req.session.destroy((err) => {
+      if (err) {
+        return next(err);
+      }
+      res.clearCookie('connect.sid'); // Nome padrão do cookie da sessão do express-session
+      res.redirect('/'); // Redireciona para a página de login
+    });
+  });
+});
+
+// Rota para o frontend verificar se está logado e obter dados do usuário
+app.get('/api/me', isAuth, (req, res) => {
+  // req.user é o perfil do Discord populado pelo Passport
+  res.json({
+    id: req.user.id,
+    username: req.user.username,
+    avatar: req.user.avatar,
+    discriminator: req.user.discriminator // Se ainda usar, senão pode remover
+  });
+});
+
+// --- ROTA DA API DO TRACKER (Protegida) ---
+app.get("/api/avatars/:id", isAuth, async (req, res) => {
   try {
     const requestedUserId = req.params.id;
-
-    if (!/^\d{17,19}$/.test(requestedUserId)) { // Validação básica do formato do ID
+    if (!/^\d{17,19}$/.test(requestedUserId)) {
         return res.status(400).json({ error: "Formato de ID de usuário inválido." });
     }
-
     let userFromDb = await AvatarModel.findOne({ userId: requestedUserId });
 
     if (!userFromDb) {
-      // Usuário não encontrado no banco de dados local, tentar buscar na API do Discord
       console.log(`Usuário ${requestedUserId} não encontrado no DB. Buscando no Discord...`);
-
-      if (!DISCORD_BOT_TOKEN) {
-        console.warn("AVISO: DISCORD_BOT_TOKEN não está configurado no .env. Não é possível buscar dados ao vivo do Discord.");
-        // Não retorna 404 aqui ainda, pois o frontend pode ter sido feito para esperar dados mesmo sem fallback.
-        // Ou, se preferir, pode retornar um 404 específico:
-        // return res.status(404).json({ error: "Usuário não encontrado no banco de dados local. Busca ao vivo desabilitada." });
-        // Por ora, vamos seguir com a lógica de que um 404 só ocorre se não achar em lugar nenhum.
-         return res.status(404).json({ error: "Usuário não encontrado no banco de dados local e busca ao vivo desabilitada (sem token)." });
+      if (!process.env.DISCORD_BOT_TOKEN) {
+        console.warn("AVISO: DISCORD_BOT_TOKEN não está configurado.");
+        return res.status(404).json({ error: "Usuário não encontrado no banco de dados local e busca ao vivo desabilitada (sem token de bot)." });
       }
-
       const discordApiUrl = `https://discord.com/api/v10/users/${requestedUserId}`;
       const discordResponse = await fetch(discordApiUrl, {
         method: 'GET',
-        headers: {
-          'Authorization': `Bot ${DISCORD_BOT_TOKEN}`,
-          'User-Agent': 'CelestialUserTrackerAPI/1.0 (https://yourdomain.com, seuemail@example.com)' // Bom adicionar um User-Agent
-        }
+        headers: { 'Authorization': `Bot ${process.env.DISCORD_BOT_TOKEN}`, 'User-Agent': 'CelestialUserTrackerAPI/1.0' }
       });
 
       if (!discordResponse.ok) {
-        if (discordResponse.status === 404) {
-          console.log(`Usuário ${requestedUserId} também não encontrado no Discord.`);
-          return res.status(404).json({ error: "Usuário não encontrado no banco de dados local nem no Discord." });
-        }
+        if (discordResponse.status === 404) return res.status(404).json({ error: "Usuário não encontrado no banco de dados local nem no Discord." });
         const errorText = await discordResponse.text();
         console.error(`Erro ao buscar usuário ${requestedUserId} do Discord: ${discordResponse.status} - ${discordResponse.statusText}. Detalhes: ${errorText}`);
         return res.status(discordResponse.status).json({ error: `Erro ao consultar a API do Discord: ${discordResponse.statusText}` });
       }
-
       const discordUserData = await discordResponse.json();
-      console.log(`Dados do usuário ${requestedUserId} encontrados no Discord: ${discordUserData.username}`);
-
       const newUserRecordData = {
         userId: discordUserData.id,
         usernames: [discordUserData.username],
@@ -99,60 +178,60 @@ app.get("/api/avatars/:id", async (req, res) => {
         lastJoinCall: null,
         lastLeaveCall: null,
       };
-
       if (discordUserData.avatar) {
-        const avatarExtension = discordUserData.avatar.startsWith("a_") ? "gif" : "png";
-        newUserRecordData.avatars.push(`https://cdn.discordapp.com/avatars/${discordUserData.id}/${discordUserData.avatar}.${avatarExtension}?size=1024`);
+        newUserRecordData.avatars.push(`https://cdn.discordapp.com/avatars/${discordUserData.id}/${discordUserData.avatar}.${discordUserData.avatar.startsWith("a_") ? "gif" : "png"}?size=1024`);
       }
-      // else: o array de avatares permanece vazio, o que é ok.
-
       try {
         userFromDb = await AvatarModel.create(newUserRecordData);
-        console.log(`Usuário ${requestedUserId} (não estava no DB) foi buscado do Discord e salvo com sucesso.`);
+        console.log(`Usuário ${requestedUserId} (não estava no DB) foi buscado do Discord e salvo.`);
       } catch (dbError) {
-        console.error(`Erro ao salvar o novo usuário ${requestedUserId} (vindo do Discord) no DB:`, dbError);
+        console.error(`Erro ao salvar o novo usuário ${requestedUserId} no DB:`, dbError);
         return res.status(500).json({ error: "Usuário encontrado no Discord, mas falha ao salvar no banco de dados local." });
       }
     }
-
-    // Envia os dados do usuário (seja do DB original ou recém-criados a partir do Discord)
     res.json({
       userId: userFromDb.userId,
       usernames: userFromDb.usernames || [],
       avatars: userFromDb.avatars || [],
-      lastJoinCall: userFromDb.lastJoinCall, // Será null se for um novo usuário ou se nunca usou call
-      lastLeaveCall: userFromDb.lastLeaveCall, // Idem
-      // Você poderia adicionar aqui 'createdAt' e 'updatedAt' se fossem úteis para o frontend:
-      // createdAt: userFromDb.createdAt,
-      // updatedAt: userFromDb.updatedAt,
+      lastJoinCall: userFromDb.lastJoinCall,
+      lastLeaveCall: userFromDb.lastLeaveCall,
+      createdAt: userFromDb.createdAt,
+      updatedAt: userFromDb.updatedAt,
     });
-
   } catch (err) {
     console.error(`Erro GERAL na rota /api/avatars/${req.params.id}:`, err);
-    res.status(500).json({ error: "Erro interno desconhecido no servidor." });
+    if (!res.headersSent) { // Evita erro se já enviou resposta (ex: por !discordResponse.ok)
+      res.status(500).json({ error: "Erro interno desconhecido no servidor." });
+    }
   }
 });
 
-// Rota raiz para um health check ou página de boas-vindas da API
-app.get("/", (req, res) => {
-  res.send("🚀 API Celestial User Tracker está online e funcionando!");
+// --- ROTAS PARA SERVIR ARQUIVOS DO FRONTEND ---
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/', (req, res) => {
+  if (req.isAuthenticated()) {
+    res.redirect('/dashboard.html');
+  } else {
+    res.sendFile(path.join(__dirname, 'public', 'index.html')); // Página de Login
+  }
 });
 
-// Tratamento para rotas não encontradas (404) - deve ser o último manipulador de rota
+// Redireciona para dashboard se tentar acessar /dashboard.html sem estar logado e a rota raiz falhar
+app.get('/dashboard.html', isAuth, (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
+});
+
+
+// --- TRATAMENTO DE ERROS E INICIAR SERVIDOR ---
 app.use((req, res, next) => {
-  res.status(404).json({ error: "Rota não encontrada." });
+  res.status(404).sendFile(path.join(__dirname, 'public', '404.html')); // Crie um 404.html se quiser
 });
-
-// Middleware de tratamento de erro genérico - deve ser o último app.use()
 app.use((err, req, res, next) => {
   console.error("Erro não tratado:", err.stack || err);
   res.status(500).json({ error: 'Ocorreu um erro inesperado no servidor.' });
 });
 
-// Iniciar o servidor
 app.listen(PORT, () => {
   console.log(`🔊 Servidor API rodando na porta ${PORT}`);
-  if (!DISCORD_BOT_TOKEN) {
-    console.warn("⚠️ AVISO: DISCORD_BOT_TOKEN não está configurado. A funcionalidade de buscar usuários (não encontrados no DB) diretamente do Discord estará DESABILITADA.");
-  }
 });
