@@ -1,4 +1,4 @@
-// server.js
+// server.js (PARA SUA API NO RENDER)
 import express from "express";
 import mongoose from "mongoose";
 import cors from "cors";
@@ -7,29 +7,25 @@ import fetch from 'node-fetch';
 import session from 'express-session';
 import passport from 'passport';
 import { Strategy as DiscordStrategy } from 'passport-discord';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-// Configuração para __dirname em ES Modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 dotenv.config();
 
-// --- CONFIGURAÇÃO DO APP E VARIÁVEIS ---
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000; // Render define a porta, mas 3000 é um bom padrão local
 
-const frontendUrl = process.env.FRONTEND_URL || `http://localhost:${PORT}`; // Para CORS, se necessário no futuro
-
+// Configuração de CORS
+if (!process.env.FRONTEND_CORS_ORIGIN) {
+  console.warn("AVISO: FRONTEND_CORS_ORIGIN não definido no .env. CORS pode não funcionar corretamente.");
+}
 app.use(cors({
-  origin: frontendUrl, // Ajuste se o frontend estiver em um domínio totalmente separado
+  origin: process.env.FRONTEND_CORS_ORIGIN, // Ex: https://jesusdiscordjs.github.io
   credentials: true
 }));
 
-// --- SESSÃO E AUTENTICAÇÃO (PASSPORT) ---
+app.set('trust proxy', 1); // Essencial para secure cookies atrás de um proxy como o do Render
+
 if (!process.env.SESSION_SECRET) {
-  console.error("ERRO: SESSION_SECRET não definida no .env. A aplicação não pode iniciar com segurança.");
+  console.error("ERRO CRÍTICO: SESSION_SECRET não definida no .env. A aplicação não pode iniciar.");
   process.exit(1);
 }
 app.use(session({
@@ -37,51 +33,39 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   cookie: {
-    maxAge: 1000 * 60 * 60 * 24 * 7 // 7 dias de sessão
-    // secure: process.env.NODE_ENV === 'production', // Use true em produção com HTTPS
-    // httpOnly: true,
-    // sameSite: 'lax' // ou 'strict'
+    maxAge: 1000 * 60 * 60 * 24 * 7, // 7 dias
+    secure: true, // Requer HTTPS. Essencial para SameSite=None. Render fornece HTTPS.
+    httpOnly: true,
+    sameSite: 'none' // Necessário para cookies de sessão cross-site
   }
-  // Para produção, considere usar um session store persistente como connect-mongo
 }));
 
 app.use(passport.initialize());
 app.use(passport.session());
 
 passport.serializeUser((user, done) => {
-  // 'user' aqui é o 'profile' retornado pela DiscordStrategy
-  done(null, user); // Salva o perfil completo do Discord na sessão
+  done(null, user); // Salva o perfil do Discord retornado pela strategy
 });
 
-passport.deserializeUser(async (user, done) => {
-  // 'user' aqui é o perfil completo que foi salvo na sessão
-  // Não precisamos buscar na API do Discord novamente a cada request se já temos o perfil
-  done(null, user);
+passport.deserializeUser((user, done) => {
+  done(null, user); // Disponibiliza o perfil salvo em req.user
 });
-
 
 if (!process.env.DISCORD_CLIENT_ID || !process.env.DISCORD_CLIENT_SECRET || !process.env.CALLBACK_URL) {
-  console.error("ERRO: Variáveis de ambiente para OAuth2 do Discord (CLIENT_ID, CLIENT_SECRET, CALLBACK_URL) não estão completamente definidas.");
-  // Considere não iniciar o app ou desabilitar as rotas de auth
+  console.error("ERRO CRÍTICO: Variáveis de ambiente para OAuth2 do Discord não estão completamente definidas.");
 }
-
 passport.use(new DiscordStrategy({
   clientID: process.env.DISCORD_CLIENT_ID,
   clientSecret: process.env.DISCORD_CLIENT_SECRET,
-  callbackURL: process.env.CALLBACK_URL,
-  scope: ['identify', 'email', 'guilds'] // Escopos comuns: identify (obrigatório), email, guilds
+  callbackURL: process.env.CALLBACK_URL, // Ex: https://sua-api.onrender.com/auth/discord/callback
+  scope: ['identify', 'email', 'guilds'] // 'email' e 'guilds' são opcionais
 }, (accessToken, refreshToken, profile, done) => {
-  // 'profile' contém os dados do usuário do Discord.
-  // profile.id, profile.username, profile.discriminator, profile.avatar, profile.email, profile.guilds etc.
-  // Você poderia verificar/salvar/atualizar o usuário no seu DB aqui se necessário.
-  // Por exemplo, para associar o login do Discord a um usuário interno do seu sistema.
-  // Para este tracker, o perfil do Discord na sessão é suficiente por enquanto.
-  return done(null, profile); // Passa o perfil para serializeUser
+  // profile contém dados do usuário: profile.id, profile.username, profile.avatar etc.
+  return done(null, profile);
 }));
 
-// --- CONEXÃO COM MONGODB ---
 if (!process.env.MONGO_URI) {
-  console.error("ERRO: MONGO_URI não definida no .env. A aplicação não pode iniciar.");
+  console.error("ERRO CRÍTICO: MONGO_URI não definida no .env.");
   process.exit(1);
 }
 mongoose.connect(process.env.MONGO_URI, { dbName: "discordAvatares" })
@@ -91,7 +75,6 @@ mongoose.connect(process.env.MONGO_URI, { dbName: "discordAvatares" })
     process.exit(1);
   });
 
-// --- SCHEMAS E MODELOS ---
 const avatarSchema = new mongoose.Schema({
   userId: { type: String, index: true, unique: true, required: true },
   usernames: { type: [String], default: [] },
@@ -101,93 +84,77 @@ const avatarSchema = new mongoose.Schema({
 }, { timestamps: true });
 const AvatarModel = mongoose.model("Avatar", avatarSchema);
 
-// --- MIDDLEWARE DE AUTENTICAÇÃO ---
 const isAuth = (req, res, next) => {
-  if (req.isAuthenticated()) { // passport adiciona isAuthenticated() ao objeto req
+  if (req.isAuthenticated()) {
     return next();
   }
   res.status(401).json({ error: "Não autorizado. Por favor, faça login." });
 };
 
 // --- ROTAS DE AUTENTICAÇÃO ---
-app.get('/auth/discord', passport.authenticate('discord')); // Inicia o fluxo OAuth2
+app.get('/auth/discord', passport.authenticate('discord'));
 
 app.get('/auth/discord/callback', passport.authenticate('discord', {
-  failureRedirect: '/?error=authfailed' // Redireciona para a pág. de login com erro
+  failureRedirect: `${process.env.FRONTEND_LOGIN_URL}?error=auth_failed` // Volta para pág de login do frontend com erro
 }), (req, res) => {
-  // Sucesso na autenticação
-  res.redirect('/dashboard.html'); // Redireciona para a dashboard
+  // Sucesso! Redireciona para a dashboard NO SEU SITE DO GITHUB PAGES
+  res.redirect(process.env.FRONTEND_DASHBOARD_URL || '/');
 });
 
 app.get('/auth/logout', (req, res, next) => {
   req.logout((err) => {
     if (err) { return next(err); }
     req.session.destroy((err) => {
-      if (err) {
-        return next(err);
-      }
-      res.clearCookie('connect.sid'); // Nome padrão do cookie da sessão do express-session
-      res.redirect('/'); // Redireciona para a página de login
+      if (err) return next(err);
+      res.clearCookie('connect.sid', { path: '/', sameSite: 'none', secure: true });
+      // Envia uma resposta JSON, o frontend fará o redirecionamento para sua pág de login
+      res.status(200).json({ message: "Logout bem-sucedido", redirectTo: process.env.FRONTEND_LOGIN_URL });
     });
   });
 });
 
-// Rota para o frontend verificar se está logado e obter dados do usuário
+// Rota para o frontend verificar o status do login e pegar dados do usuário
 app.get('/api/me', isAuth, (req, res) => {
-  // req.user é o perfil do Discord populado pelo Passport
-  res.json({
+  res.json({ // Retorna os dados do Discord que foram salvos na sessão
     id: req.user.id,
     username: req.user.username,
     avatar: req.user.avatar,
-    discriminator: req.user.discriminator // Se ainda usar, senão pode remover
+    discriminator: req.user.discriminator // Mantido por enquanto
   });
 });
 
 // --- ROTA DA API DO TRACKER (Protegida) ---
 app.get("/api/avatars/:id", isAuth, async (req, res) => {
+  // ... (A lógica completa desta rota que te enviei antes, com try-catch, busca no DB, fallback para API do Discord com BOT_TOKEN, etc.)
+  // Cole aqui a implementação completa da rota /api/avatars/:id que já tínhamos.
+  // Vou colocar uma versão resumida para não repetir todo o bloco aqui:
   try {
     const requestedUserId = req.params.id;
     if (!/^\d{17,19}$/.test(requestedUserId)) {
-        return res.status(400).json({ error: "Formato de ID de usuário inválido." });
+        return res.status(400).json({ error: "Formato de ID inválido." });
     }
     let userFromDb = await AvatarModel.findOne({ userId: requestedUserId });
-
     if (!userFromDb) {
-      console.log(`Usuário ${requestedUserId} não encontrado no DB. Buscando no Discord...`);
       if (!process.env.DISCORD_BOT_TOKEN) {
-        console.warn("AVISO: DISCORD_BOT_TOKEN não está configurado.");
-        return res.status(404).json({ error: "Usuário não encontrado no banco de dados local e busca ao vivo desabilitada (sem token de bot)." });
+        return res.status(404).json({ error: "Usuário não no DB e busca ao vivo desabilitada." });
       }
       const discordApiUrl = `https://discord.com/api/v10/users/${requestedUserId}`;
       const discordResponse = await fetch(discordApiUrl, {
         method: 'GET',
         headers: { 'Authorization': `Bot ${process.env.DISCORD_BOT_TOKEN}`, 'User-Agent': 'CelestialUserTrackerAPI/1.0' }
       });
-
-      if (!discordResponse.ok) {
-        if (discordResponse.status === 404) return res.status(404).json({ error: "Usuário não encontrado no banco de dados local nem no Discord." });
-        const errorText = await discordResponse.text();
-        console.error(`Erro ao buscar usuário ${requestedUserId} do Discord: ${discordResponse.status} - ${discordResponse.statusText}. Detalhes: ${errorText}`);
-        return res.status(discordResponse.status).json({ error: `Erro ao consultar a API do Discord: ${discordResponse.statusText}` });
+      if (!discordResponse.ok) { /* ... tratamento de erro ... */ 
+        if (discordResponse.status === 404) return res.status(404).json({ error: "Usuário não encontrado no DB nem no Discord." });
+        const errorText = await discordResponse.text(); // Pega o corpo do erro
+        console.error(`Erro Discord API: ${discordResponse.status} - ${errorText}`);
+        return res.status(discordResponse.status).json({ error: `Erro API Discord: ${discordResponse.statusText || 'Erro desconhecido'}` });
       }
       const discordUserData = await discordResponse.json();
-      const newUserRecordData = {
-        userId: discordUserData.id,
-        usernames: [discordUserData.username],
-        avatars: [],
-        lastJoinCall: null,
-        lastLeaveCall: null,
-      };
+      const newUserRecordData = { userId: discordUserData.id, usernames: [discordUserData.username], avatars: [], lastJoinCall: null, lastLeaveCall: null };
       if (discordUserData.avatar) {
         newUserRecordData.avatars.push(`https://cdn.discordapp.com/avatars/${discordUserData.id}/${discordUserData.avatar}.${discordUserData.avatar.startsWith("a_") ? "gif" : "png"}?size=1024`);
       }
-      try {
-        userFromDb = await AvatarModel.create(newUserRecordData);
-        console.log(`Usuário ${requestedUserId} (não estava no DB) foi buscado do Discord e salvo.`);
-      } catch (dbError) {
-        console.error(`Erro ao salvar o novo usuário ${requestedUserId} no DB:`, dbError);
-        return res.status(500).json({ error: "Usuário encontrado no Discord, mas falha ao salvar no banco de dados local." });
-      }
+      userFromDb = await AvatarModel.create(newUserRecordData);
     }
     res.json({
       userId: userFromDb.userId,
@@ -199,37 +166,25 @@ app.get("/api/avatars/:id", isAuth, async (req, res) => {
       updatedAt: userFromDb.updatedAt,
     });
   } catch (err) {
-    console.error(`Erro GERAL na rota /api/avatars/${req.params.id}:`, err);
-    if (!res.headersSent) { // Evita erro se já enviou resposta (ex: por !discordResponse.ok)
-      res.status(500).json({ error: "Erro interno desconhecido no servidor." });
+    console.error(`Erro GERAL /api/avatars/${req.params.id}:`, err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Erro interno." });
     }
   }
 });
 
-// --- ROTAS PARA SERVIR ARQUIVOS DO FRONTEND ---
-app.use(express.static(path.join(__dirname, 'public')));
-
+// --- ROTA RAIZ DA API ---
 app.get('/', (req, res) => {
-  if (req.isAuthenticated()) {
-    res.redirect('/dashboard.html');
-  } else {
-    res.sendFile(path.join(__dirname, 'public', 'index.html')); // Página de Login
-  }
+  res.json({ message: "🚀 API Celestial User Tracker está online e configurada para frontend separado!" });
 });
 
-// Redireciona para dashboard se tentar acessar /dashboard.html sem estar logado e a rota raiz falhar
-app.get('/dashboard.html', isAuth, (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
-});
-
-
-// --- TRATAMENTO DE ERROS E INICIAR SERVIDOR ---
+// --- TRATAMENTO DE ERROS ---
 app.use((req, res, next) => {
-  res.status(404).sendFile(path.join(__dirname, 'public', '404.html')); // Crie um 404.html se quiser
+  res.status(404).json({ error: "Endpoint da API não encontrado." });
 });
 app.use((err, req, res, next) => {
-  console.error("Erro não tratado:", err.stack || err);
-  res.status(500).json({ error: 'Ocorreu um erro inesperado no servidor.' });
+  console.error("Erro não tratado no servidor:", err.stack || err);
+  res.status(500).json({ error: 'Ocorreu um erro inesperado na API.' });
 });
 
 app.listen(PORT, () => {
