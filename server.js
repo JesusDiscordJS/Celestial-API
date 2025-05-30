@@ -43,7 +43,7 @@ app.use(cors({
   credentials: true
 }));
 
-app.set('trust proxy', 1);
+app.set('trust proxy', 1); // Necessário se estiver atrás de um proxy como Render
 
 app.use(session({
   secret: process.env.SESSION_SECRET,
@@ -51,9 +51,9 @@ app.use(session({
   saveUninitialized: false,
   cookie: {
     maxAge: 1000 * 60 * 60 * 24 * 7, // 7 dias
-    secure: true,
+    secure: true, // Requer HTTPS
     httpOnly: true,
-    sameSite: 'none'
+    sameSite: 'none' // Necessário para cross-site cookies com HTTPS
   }
 }));
 
@@ -71,29 +71,28 @@ passport.deserializeUser((userData, done) => {
 passport.use(new DiscordStrategy({
   clientID: process.env.DISCORD_CLIENT_ID,
   clientSecret: process.env.DISCORD_CLIENT_SECRET,
-  callbackURL: process.env.CALLBACK_URL,
-  scope: ['identify', 'email', 'guilds', 'relationships.read']
+  callbackURL: process.env.CALLBACK_URL, // Este é o callback da API
+  scope: ['identify', 'email', 'guilds', 'relationships.read'] // Ajuste os escopos conforme necessário
 }, (accessToken, refreshToken, profile, done) => {
+  // Aqui você normalmente buscaria ou criaria um usuário no seu DB
+  // Por agora, apenas passamos o perfil e o token
   return done(null, { accessToken, profile });
 }));
 
 // --- CONEXÃO COM MONGODB E DEFINIÇÃO DE ESQUEMA ---
-// Conectando ao banco de dados usado pelo bot Python
-mongoose.connect(process.env.MONGO_URI, { dbName: "tracker_db" }) // ATENÇÃO: dbName deve ser 'tracker_db'
+mongoose.connect(process.env.MONGO_URI, { dbName: "tracker_db" })
   .then(() => console.log("✅ MongoDB conectado com sucesso ao banco 'tracker_db'!"))
   .catch((err) => {
     console.error("❌ Erro ao conectar ao MongoDB:", err);
     process.exit(1);
   });
 
-// Esquema para informações de servidor (subdocumento)
 const serverInfoSchema = new mongoose.Schema({
   guild_id: String,
   guild_name: String,
   first_seen: Date
 }, { _id: false });
 
-// Esquema para as alterações dentro de uma entrada de histórico (subdocumento)
 const historyChangeSchema = new mongoose.Schema({
   username_global: String,
   avatar_url: String,
@@ -102,27 +101,24 @@ const historyChangeSchema = new mongoose.Schema({
   server_joined: serverInfoSchema
 }, { _id: false });
 
-// Esquema para uma entrada no histórico (subdocumento)
 const historyEntrySchema = new mongoose.Schema({
   changed_at: Date,
   changes: historyChangeSchema
 }, { _id: false });
 
-// Esquema principal do usuário, alinhado com o bot Python
 const userTrackerSchema = new mongoose.Schema({
-  user_id: { type: String, index: true, unique: true, required: true }, // Consistente com o bot
+  user_id: { type: String, index: true, unique: true, required: true },
   username_global: String,
   avatar_urls: { type: [String], default: [] },
   banner_urls: { type: [String], default: [] },
   nicknames: { type: [String], default: [] },
   servers: { type: [serverInfoSchema], default: [] },
   history: { type: [historyEntrySchema], default: [] }
-}, { timestamps: true }); // timestamps: true adiciona createdAt e updatedAt
+}, { timestamps: true });
 
-// O modelo agora se refere à coleção "users" (nome da coleção usado pelo bot Python)
 const UserTrackerModel = mongoose.model("UserTracker", userTrackerSchema, "users");
 
-// --- MIDDLEWARE DE AUTENTICAÇÃO ---
+// --- MIDDLEWARE DE AUTENTICAÇÃO (Ainda usado por /api/me e /api/me/friends) ---
 const isAuth = (req, res, next) => {
   if (req.isAuthenticated()) {
     return next();
@@ -130,12 +126,13 @@ const isAuth = (req, res, next) => {
   res.status(401).json({ error: "Não autorizado. Por favor, faça login." });
 };
 
-// --- ROTAS DE AUTENTICAÇÃO ---
+// --- ROTAS DE AUTENTICAÇÃO (Ainda presentes para login opcional no dashboard) ---
 app.get('/auth/discord', passport.authenticate('discord'));
 
 app.get('/auth/discord/callback', passport.authenticate('discord', {
-  failureRedirect: `${process.env.FRONTEND_LOGIN_URL}?error=auth_failed`
+  failureRedirect: `${process.env.FRONTEND_LOGIN_URL}?error=auth_failed` // Página de login do frontend
 }), (req, res) => {
+  // Redireciona para a dashboard do frontend após o login bem-sucedido
   res.redirect(process.env.FRONTEND_DASHBOARD_URL);
 });
 
@@ -145,11 +142,13 @@ app.get('/auth/logout', (req, res, next) => {
     req.session.destroy((err) => {
       if (err) return next(err);
       res.clearCookie('connect.sid', { path: '/', sameSite: 'none', secure: true });
+      // Retorna um JSON indicando sucesso e para onde redirecionar no frontend
       res.status(200).json({ message: "Logout bem-sucedido", redirectTo: process.env.FRONTEND_LOGIN_URL });
     });
   });
 });
 
+// Endpoint para obter informações do usuário logado (ainda requer autenticação)
 app.get('/api/me', isAuth, (req, res) => {
   if (!req.user || !req.user.profile) {
     return res.status(500).json({ error: "Dados de usuário incompletos na sessão." });
@@ -160,10 +159,11 @@ app.get('/api/me', isAuth, (req, res) => {
     username: profile.username,
     avatar: profile.avatar,
     discriminator: profile.discriminator,
-    global_name: profile.global_name // Adicionado para novos usernames
+    global_name: profile.global_name
   });
 });
 
+// Endpoint para amigos (exemplo, ainda requer autenticação)
 app.get('/api/me/friends', isAuth, async (req, res) => {
   if (!req.user || !req.user.accessToken) {
     return res.status(401).json({ error: "Access token não encontrado. Por favor, refaça o login." });
@@ -184,13 +184,13 @@ app.get('/api/me/friends', isAuth, async (req, res) => {
     }
     const relationships = await response.json();
     const friends = relationships
-      .filter(rel => rel.type === 1)
+      .filter(rel => rel.type === 1) // type 1 são amigos
       .map(friendRel => ({
         id: friendRel.id,
         username: friendRel.user.username,
         discriminator: friendRel.user.discriminator,
         avatar: friendRel.user.avatar,
-        global_name: friendRel.user.global_name // Adicionado para novos usernames
+        global_name: friendRel.user.global_name
       }));
     res.json(friends);
   } catch (error) {
@@ -199,20 +199,18 @@ app.get('/api/me/friends', isAuth, async (req, res) => {
   }
 });
 
-// --- ROTA DA API DO TRACKER (MODIFICADA) ---
-app.get("/api/avatars/:id", isAuth, async (req, res) => {
+// --- ROTA DA API DO TRACKER (MODIFICADA PARA SER PÚBLICA) ---
+// O middleware 'isAuth' foi REMOVIDO desta rota
+app.get("/api/avatars/:id", async (req, res) => {
   try {
     const requestedUserId = req.params.id;
-    // IDs do Discord são numéricos e geralmente têm entre 17 e 19 dígitos (pode ser 20 em casos raros no futuro)
     if (!/^\d{17,20}$/.test(requestedUserId)) {
         return res.status(400).json({ error: "Formato de ID de usuário inválido." });
     }
 
-    // Busca no MongoDB usando o novo modelo e o campo 'user_id'
     let userFromDb = await UserTrackerModel.findOne({ user_id: requestedUserId });
 
     if (!userFromDb) {
-      // Se o usuário não for encontrado no DB, tenta buscar na API do Discord (fallback)
       if (!process.env.DISCORD_BOT_TOKEN) {
         return res.status(404).json({
           error: "Usuário não encontrado no banco de dados. A busca ao vivo no Discord está desabilitada (token do bot não configurado)."
@@ -241,10 +239,10 @@ app.get("/api/avatars/:id", isAuth, async (req, res) => {
       }
 
       const discordUserData = await discordResponse.json();
-      const globalUsername = discordUserData.global_name || discordUserData.username; // Prioriza global_name
+      const globalUsername = discordUserData.global_name || discordUserData.username;
       const fullUsername = discordUserData.discriminator && discordUserData.discriminator !== "0"
         ? `${discordUserData.username}#${discordUserData.discriminator}`
-        : globalUsername; // Username que o bot python geralmente salva como str(member)
+        : globalUsername;
 
       const newUserRecordData = {
         user_id: discordUserData.id,
@@ -252,8 +250,8 @@ app.get("/api/avatars/:id", isAuth, async (req, res) => {
         avatar_urls: [],
         banner_urls: [],
         nicknames: [],
-        servers: [], // O bot Python populará isso com mais detalhes
-        history: [{ // Adiciona uma entrada inicial ao histórico
+        servers: [],
+        history: [{
             changed_at: new Date(),
             changes: {
                 username_global: fullUsername,
@@ -267,7 +265,7 @@ app.get("/api/avatars/:id", isAuth, async (req, res) => {
           `https://cdn.discordapp.com/avatars/${discordUserData.id}/${discordUserData.avatar}.${discordUserData.avatar.startsWith("a_") ? "gif" : "png"}?size=1024`
         );
       }
-      if (discordUserData.banner) { // Banner de perfil global do usuário
+      if (discordUserData.banner) {
         newUserRecordData.banner_urls.push(
           `https://cdn.discordapp.com/banners/${discordUserData.id}/${discordUserData.banner}.${discordUserData.banner.startsWith("a_") ? "gif" : "png"}?size=1024`
         );
@@ -278,7 +276,6 @@ app.get("/api/avatars/:id", isAuth, async (req, res) => {
       console.log(`Novo registro para ${requestedUserId} criado com sucesso.`);
     }
 
-    // Retorna os dados completos do usuário conforme o novo esquema
     res.json({
       user_id: userFromDb.user_id,
       username_global: userFromDb.username_global,
