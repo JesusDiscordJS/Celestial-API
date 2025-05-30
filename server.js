@@ -1,26 +1,20 @@
 // server.js
-require('dotenv').config(); // Carrega variáveis de ambiente do arquivo .env para desenvolvimento local
+require('dotenv').config();
 const express = require('express');
-const { MongoClient } = require('mongodb');
+// Importe 'Long' junto com MongoClient
+const { MongoClient, Long } = require('mongodb');
 const cors = require('cors');
 
-// --- Configuração ---
+// --- Configuração (sem alterações aqui) ---
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://thiago:OptozQfMn5s2HEG6@cluster0.r2krhdh.mongodb.net/";
-const DB_NAME = "tracker_db"; // O nome do banco de dados que seu bot usa
-const COLLECTION_NAME = "users"; // A coleção onde os dados dos usuários são salvos
-const PORT = process.env.PORT || 3000; // Porta para a API rodar
+const DB_NAME = "tracker_db";
+const COLLECTION_NAME = "users";
+const PORT = process.env.PORT || 3000;
 
-// --- Inicialização do App Express ---
 const app = express();
+app.use(cors({ origin: "*", methods: ["GET"] }));
+app.use(express.json());
 
-// --- Middlewares ---
-app.use(cors({ // Configuração do CORS
-    origin: "*", // Para desenvolvimento. Em produção, restrinja aos seus domínios.
-    methods: ["GET"], // Apenas métodos GET para estes endpoints de leitura
-}));
-app.use(express.json()); // Para parsear JSON no corpo de requisições (se você adicionar POST/PUT depois)
-
-// --- Conexão com o MongoDB ---
 let db;
 let usersCollection;
 
@@ -32,34 +26,26 @@ MongoClient.connect(MONGO_URI)
     })
     .catch(error => {
         console.error('❌ Erro ao conectar ao MongoDB:', error);
-        // Em um cenário real, você pode querer que a API não inicie ou retorne um status de erro global.
-        // Por enquanto, os endpoints verificarão se usersCollection está disponível.
-        process.exit(1); // Encerra o processo se não conseguir conectar ao DB
+        process.exit(1);
     });
 
 // --- Endpoints da API ---
 
-// Endpoint Raiz
+// Endpoint Raiz (sem alterações)
 app.get('/', (req, res) => {
     res.json({ message: "Bem-vindo à API do Celestial Tracker (Node.js). Acesse os dados dos usuários em /users/" });
 });
 
-// Listar todos os usuários (com paginação)
+// Listar todos os usuários (sem alterações na lógica de ID, pois skip/limit são pequenos)
 app.get('/users', async (req, res) => {
     if (!usersCollection) {
         return res.status(503).json({ error: "Serviço indisponível: conexão com MongoDB falhou." });
     }
-
     try {
         const skip = parseInt(req.query.skip) || 0;
         const limit = parseInt(req.query.limit) || 10;
-
         const usersCursor = usersCollection.find().skip(skip).limit(limit);
-        const usersArray = await usersCursor.toArray(); // Converte o cursor para um array
-
-        if (!usersArray) { // usersArray será [] se nada for encontrado, o que é ok
-            return res.json([]);
-        }
+        const usersArray = await usersCursor.toArray();
         res.json(usersArray);
     } catch (error) {
         console.error("Erro ao buscar usuários:", error);
@@ -67,21 +53,16 @@ app.get('/users', async (req, res) => {
     }
 });
 
-// Buscar um usuário específico pelo ID
+// Buscar um usuário específico pelo ID (CORRIGIDO)
 app.get('/users/:userIdStr', async (req, res) => {
     if (!usersCollection) {
         return res.status(503).json({ error: "Serviço indisponível: conexão com MongoDB falhou." });
     }
 
+    const userIdStr = req.params.userIdStr;
     try {
-        const userIdStr = req.params.userIdStr;
-        // Seu bot salva `member.id` (que é um int) como `user_id`.
-        // O path parameter vem como string, então precisa ser convertido para int.
-        const userIdQuery = parseInt(userIdStr);
-
-        if (isNaN(userIdQuery)) {
-            return res.status(400).json({ error: `ID de usuário inválido: '${userIdStr}'. Deve ser um número.` });
-        }
+        // Use Long.fromString para converter a string do ID para um tipo Long BSON
+        const userIdQuery = Long.fromString(userIdStr);
 
         const user = await usersCollection.findOne({ user_id: userIdQuery });
 
@@ -90,33 +71,33 @@ app.get('/users/:userIdStr', async (req, res) => {
         } else {
             res.status(404).json({ error: `Usuário com ID '${userIdStr}' não encontrado.` });
         }
-    } catch (error) {
-        console.error(`Erro ao buscar usuário ${req.params.userIdStr}:`, error);
+    } catch (error) { // Este catch agora também pode pegar erros de Long.fromString
+        console.error(`Erro ao processar/buscar usuário ${userIdStr}:`, error);
+        // Verifica se o erro é de conversão do Long para um bad request mais específico
+        if (error.message && (error.message.includes("is not a valid string representation of a Long") || error.message.toLowerCase().includes("out of range"))) {
+             return res.status(400).json({ error: `ID de usuário inválido: '${userIdStr}'. Deve ser uma representação numérica válida para um ID de 64 bits.` });
+        }
         res.status(500).json({ error: "Erro interno ao buscar usuário.", details: error.message });
     }
 });
 
-// Exemplo de endpoint mais específico: Histórico de Apelidos
+// Exemplo de endpoint mais específico: Histórico de Apelidos (CORRIGIDO)
 app.get('/users/:userIdStr/history/nicknames', async (req, res) => {
     if (!usersCollection) {
         return res.status(503).json({ error: "Serviço indisponível: conexão com MongoDB falhou." });
     }
 
+    const userIdStr = req.params.userIdStr;
     try {
-        const userIdStr = req.params.userIdStr;
-        const userIdQuery = parseInt(userIdStr);
+        // Use Long.fromString aqui também
+        const userIdQuery = Long.fromString(userIdStr);
 
-        if (isNaN(userIdQuery)) {
-            return res.status(400).json({ error: `ID de usuário inválido: '${userIdStr}'. Deve ser um número.` });
-        }
-
-        // Projeta apenas os campos necessários
         const projection = { projection: { _id: 0, nicknames: 1, username_global: 1 } };
         const user = await usersCollection.findOne({ user_id: userIdQuery }, projection);
 
         if (user) {
             res.json({
-                user_id: userIdStr, // Retorna o ID string da requisição para consistência
+                user_id: userIdStr,
                 username_global: user.username_global,
                 nicknames: user.nicknames || []
             });
@@ -124,13 +105,15 @@ app.get('/users/:userIdStr/history/nicknames', async (req, res) => {
             res.status(404).json({ error: `Usuário com ID '${userIdStr}' não encontrado para buscar apelidos.` });
         }
     } catch (error) {
-        console.error(`Erro ao buscar histórico de apelidos para ${req.params.userIdStr}:`, error);
+        console.error(`Erro ao buscar histórico de apelidos para ${userIdStr}:`, error);
+        if (error.message && (error.message.includes("is not a valid string representation of a Long") || error.message.toLowerCase().includes("out of range"))) {
+             return res.status(400).json({ error: `ID de usuário inválido: '${userIdStr}'. Deve ser uma representação numérica válida para um ID de 64 bits.` });
+        }
         res.status(500).json({ error: "Erro interno ao buscar histórico de apelidos.", details: error.message });
     }
 });
 
-
-// --- Iniciar o Servidor ---
+// --- Iniciar o Servidor (sem alterações) ---
 app.listen(PORT, () => {
     console.log(`🚀 Servidor Node.js da API rodando na porta ${PORT}`);
     console.log(`Disponível em http://localhost:${PORT}`);
