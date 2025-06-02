@@ -86,11 +86,10 @@ function convertBsonDateToTimestamp(value) {
         if (value.$date.$numberLong && typeof value.$date.$numberLong === 'string') {
             return parseInt(value.$date.$numberLong, 10);
         } else if (typeof value.$date === 'string') {
-            // Tenta converter string ISO para timestamp. Se falhar, pode retornar NaN.
             const parsedDate = new Date(value.$date);
-            return !isNaN(parsedDate.getTime()) ? parsedDate.getTime() : value.$date; // Retorna string original se falhar
+            return !isNaN(parsedDate.getTime()) ? parsedDate.getTime() : value.$date;
         }
-    } else if (value instanceof Date) { // Se já for um objeto Date do driver MongoDB
+    } else if (value instanceof Date) {
         return value.getTime();
     }
     return value; // Fallback
@@ -98,7 +97,7 @@ function convertBsonDateToTimestamp(value) {
 
 function convertUserDocument(doc) {
     if (!doc) return doc;
-    const newDoc = { ...doc }; // Shallow copy
+    const newDoc = { ...doc };
 
     if (newDoc._id && typeof newDoc._id.toString === 'function') {
         newDoc._id = newDoc._id.toString();
@@ -172,12 +171,31 @@ function convertUserDocument(doc) {
             return newImgEntry;
         });
     }
+
+    // --- MODIFIED: Add processing for 'instagram' field ---
+    if (newDoc.instagram && Array.isArray(newDoc.instagram)) {
+        newDoc.instagram = newDoc.instagram.map(instaEntry => {
+            const newInstaEntry = { ...instaEntry }; // Shallow copy each entry
+            if (newInstaEntry.timestamp) {
+                newInstaEntry.timestamp = convertBsonDateToTimestamp(newInstaEntry.timestamp);
+            }
+            // Assuming IDs like postedByUserId, messageId, guildId, channelId are already strings
+            // as saved by the bot. If conversion were needed:
+            // if (newInstaEntry.postedByUserId) newInstaEntry.postedByUserId = convertBsonTypeToString(newInstaEntry.postedByUserId);
+            // if (newInstaEntry.messageId) newInstaEntry.messageId = convertBsonTypeToString(newInstaEntry.messageId);
+            // if (newInstaEntry.guildId) newInstaEntry.guildId = convertBsonTypeToString(newInstaEntry.guildId);
+            // if (newInstaEntry.channelId) newInstaEntry.channelId = convertBsonTypeToString(newInstaEntry.channelId);
+            return newInstaEntry;
+        });
+    }
+    // --- END MODIFICATION ---
+
     return newDoc;
 }
 
 // --- Rotas de Autenticação com Discord ---
 app.get('/auth/discord', (req, res) => {
-    const scopes = ['identify', 'email'].join(' '); // 'guilds' é opcional se você precisar verificar servidores
+    const scopes = ['identify', 'email'].join(' ');
     const discordAuthUrl = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(DISCORD_REDIRECT_URI)}&response_type=code&scope=${encodeURIComponent(scopes)}`;
     res.redirect(discordAuthUrl);
 });
@@ -218,11 +236,10 @@ app.get('/auth/discord/callback', async (req, res) => {
         const appTokenPayload = {
             discordId: discordId,
             username: discordUser.username,
-            // Gera URL do avatar. Se não tiver avatar, usa um padrão do Discord.
             avatar: discordUser.avatar ? `https://cdn.discordapp.com/avatars/${discordId}/${discordUser.avatar}.png` : `https://cdn.discordapp.com/embed/avatars/${parseInt(discordUser.discriminator, 10) % 5}.png`,
             role: userRole,
         };
-        const appToken = jwt.sign(appTokenPayload, JWT_SECRET, { expiresIn: '7d' }); // Token expira em 7 dias
+        const appToken = jwt.sign(appTokenPayload, JWT_SECRET, { expiresIn: '7d' });
 
         const targetUrl = new URL(FRONTEND_DASHBOARD_REDIRECT_URL);
         targetUrl.searchParams.set('token', appToken);
@@ -240,13 +257,13 @@ app.get('/auth/discord/callback', async (req, res) => {
 const requireAuth = (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (authHeader && authHeader.startsWith('Bearer ')) {
-        const token = authHeader.substring(7, authHeader.length); // Remove "Bearer "
+        const token = authHeader.substring(7, authHeader.length);
         jwt.verify(token, JWT_SECRET, (err, decodedToken) => {
             if (err) {
                 console.warn('Falha na verificação do JWT:', err.message);
                 return res.status(401).json({ error: 'Token inválido ou expirado. Faça login novamente.' });
             }
-            req.user = decodedToken; // Adiciona dados do usuário decodificados à requisição
+            req.user = decodedToken;
             next();
         });
     } else {
@@ -257,7 +274,6 @@ const requireAuth = (req, res, next) => {
 // --- Middleware de Verificação de Função (Role) ---
 const checkRole = (requiredRole) => {
     return (req, res, next) => {
-        // Este middleware deve rodar DEPOIS do requireAuth, então req.user deve existir
         if (!req.user || req.user.role !== requiredRole) {
             return res.status(403).json({ error: 'Acesso proibido: Função inadequada para este recurso.' });
         }
@@ -267,7 +283,6 @@ const checkRole = (requiredRole) => {
 
 // --- Rota para obter dados do usuário logado ---
 app.get('/auth/me', requireAuth, (req, res) => {
-    // req.user foi populado pelo middleware requireAuth
     res.json({
         discordId: req.user.discordId,
         username: req.user.username,
@@ -281,7 +296,6 @@ app.get('/', (req, res) => {
     res.json({ message: "Bem-vindo à API do Celestial Tracker. Use /auth/discord para login." });
 });
 
-// Rotas de dados de usuários rastreados (agora protegidas)
 app.get('/users', requireAuth, async (req, res) => {
     if (!usersCollection) return res.status(503).json({ error: "Serviço indisponível: MongoDB não conectado." });
     try {
@@ -301,7 +315,7 @@ app.get('/users/:userIdStr', requireAuth, async (req, res) => {
         const userIdQuery = Long.fromString(userIdStr);
         let user = await usersCollection.findOne({ user_id: userIdQuery });
         if (user) {
-            res.json(convertUserDocument(user));
+            res.json(convertUserDocument(user)); // convertUserDocument will now also process 'instagram'
         } else {
             res.status(404).json({ error: `Usuário com ID (tracker) '${userIdStr}' não encontrado.` });
         }
@@ -339,18 +353,70 @@ app.get('/users/:userIdStr/history/nicknames', requireAuth, async (req, res) => 
     }
 });
 
+// --- NEW: Rota para obter dados do 'instagram' de um usuário ---
+app.get('/users/:userIdStr/instagram', requireAuth, async (req, res) => {
+    if (!usersCollection) return res.status(503).json({ error: "Serviço indisponível: MongoDB não conectado." });
+    const userIdStr = req.params.userIdStr;
+    try {
+        const userIdQuery = Long.fromString(userIdStr);
+        // Projeta apenas os campos user_id e instagram para eficiência
+        const projection = { projection: { _id: 0, user_id: 1, instagram: 1 } };
+        const userFromDb = await usersCollection.findOne({ user_id: userIdQuery }, projection);
+
+        if (userFromDb) {
+            let instagramData = [];
+            if (userFromDb.instagram && Array.isArray(userFromDb.instagram)) {
+                // Processa cada entrada do array 'instagram' para converter timestamps
+                instagramData = userFromDb.instagram.map(instaEntry => {
+                    const newInstaEntry = { ...instaEntry };
+                    if (newInstaEntry.timestamp) {
+                        newInstaEntry.timestamp = convertBsonDateToTimestamp(newInstaEntry.timestamp);
+                    }
+                    // Outros IDs dentro de instaEntry (postedByUserId, messageId, etc.)
+                    // são esperados como strings, conforme salvos pelo bot.
+                    return newInstaEntry;
+                });
+            }
+            res.json({
+                user_id: convertBsonTypeToString(userFromDb.user_id), // Converte user_id para string
+                instagram: instagramData // Retorna o array processado
+            });
+        } else {
+            res.status(404).json({ error: `Usuário com ID (tracker) '${userIdStr}' não encontrado para dados do Instagram.` });
+        }
+    } catch (error) {
+        console.error(`Erro ao buscar dados do Instagram para ${userIdStr}:`, error);
+        if (error.message && (error.message.includes("is not a valid string representation of a Long") || error.message.toLowerCase().includes("out of range") || error.message.toLowerCase().includes("non-hex character"))) {
+            return res.status(400).json({ error: `ID de usuário (tracker) inválido na URL: '${userIdStr}'.` });
+        }
+        res.status(500).json({ error: "Erro interno ao buscar dados do Instagram.", details: error.message });
+    }
+});
+// --- END NEW ROUTE ---
+
+
 // --- Rotas do Painel Admin ---
 app.get('/admin/stats', requireAuth, checkRole('admin'), async (req, res) => {
     if (!usersCollection) return res.status(503).json({ error: "Serviço indisponível" });
     try {
         const totalTrackedUsers = await usersCollection.countDocuments();
         const imageStats = await usersCollection.aggregate([
-            { $match: { message_image_history: { $exists: true, $ne: [] } } }, // Apenas docs com o array existente e não vazio
+            { $match: { message_image_history: { $exists: true, $ne: [] } } },
             { $project: { numImages: { $size: "$message_image_history" } } },
             { $group: { _id: null, totalMessageImages: { $sum: "$numImages" } } }
         ]).toArray();
         const totalMessageImages = imageStats.length > 0 ? imageStats[0].totalMessageImages : 0;
-        res.json({ totalTrackedUsers, totalMessageImages });
+
+        // --- MODIFIED: Adicionar contagem de imagens do 'instagram' ---
+        const instagramImageStats = await usersCollection.aggregate([
+            { $match: { instagram: { $exists: true, $ne: [] } } }, // Usuários que possuem o campo instagram não vazio
+            { $project: { numInstagramImages: { $size: "$instagram" } } }, // Conta o número de entradas no array instagram
+            { $group: { _id: null, totalInstagramImages: { $sum: "$numInstagramImages" } } } // Soma total
+        ]).toArray();
+        const totalInstagramImages = instagramImageStats.length > 0 ? instagramImageStats[0].totalInstagramImages : 0;
+        // --- END MODIFICATION ---
+
+        res.json({ totalTrackedUsers, totalMessageImages, totalInstagramImages }); // Adicionado totalInstagramImages
     } catch (error) {
         console.error("Erro em /admin/stats:", error);
         res.status(500).json({ error: "Erro interno ao buscar estatísticas.", details: error.message });
@@ -364,9 +430,9 @@ app.get('/admin/roles/config', requireAuth, checkRole('admin'), (req, res) => {
 app.get('/admin/users/filter', requireAuth, checkRole('admin'), async (req, res) => {
     if (!usersCollection) return res.status(503).json({ error: "Serviço indisponível" });
     try {
-        const { hasMessageImages, hasAvatarHistory, usernameContains, discordId } = req.query;
+        const { hasMessageImages, hasAvatarHistory, usernameContains, discordId, hasInstagramPosts } = req.query; // --- MODIFIED: Added hasInstagramPosts ---
         let mongoQuery = {};
-        const queryParts = []; // Usar $and explicitamente se múltiplos campos são opcionais
+        const queryParts = [];
 
         if (hasMessageImages === 'true') {
             queryParts.push({ message_image_history: { $exists: true, $not: { $size: 0 } } });
@@ -378,24 +444,28 @@ app.get('/admin/users/filter', requireAuth, checkRole('admin'), async (req, res)
             const regex = { $regex: usernameContains, $options: 'i' };
             queryParts.push({ $or: [{ current_username_global: regex }, { username_global_history: regex }] });
         }
-        if (discordId) { // Assumindo que 'discordId' no filtro refere-se ao 'user_id' (tracker ID)
+        if (discordId) {
             try {
                 queryParts.push({ user_id: Long.fromString(discordId) });
             } catch (e) {
                 return res.status(400).json({ error: "Formato de ID (para user_id do tracker) inválido."});
             }
         }
+        // --- MODIFIED: Add filter for Instagram posts ---
+        if (hasInstagramPosts === 'true') {
+            queryParts.push({ instagram: { $exists: true, $not: { $size: 0 } } });
+        }
+        // --- END MODIFICATION ---
 
         if (queryParts.length > 0) {
             mongoQuery = { $and: queryParts };
         } else {
-             // Se nenhum filtro for fornecido, você pode retornar todos ou um erro/lista vazia.
-             // Para este exemplo, retornaremos todos os usuários (limitado).
+            // No filters, potentially return all or empty
         }
 
         console.log("[Admin Filter] Query MongoDB:", JSON.stringify(mongoQuery));
         const users = await usersCollection.find(mongoQuery).limit(100).sort({last_seen_overall_at: -1}).toArray();
-        res.json(users.map(user => convertUserDocument(user)));
+        res.json(users.map(user => convertUserDocument(user))); // convertUserDocument will handle 'instagram' formatting
 
     } catch (error) {
         console.error("Erro em /admin/users/filter:", error);
