@@ -1,4 +1,4 @@
-// server.js (Backend API - Completo com Discord OAuth2, JWT, /auth/me e proteção de rotas)
+// server.js (Backend API - Completo com Discord OAuth2, JWT, Painel Admin e proteção de rotas)
 require('dotenv').config();
 
 const express = require('express');
@@ -29,23 +29,20 @@ const PREMIUM_DISCORD_IDS = (process.env.PREMIUM_DISCORD_IDS || "").split(',').m
 const app = express();
 
 // --- Validação Crítica de Variáveis de Ambiente ---
-if (!CORS_ALLOWED_ORIGIN) {
-    console.error("FATAL ERROR: CORS_ALLOWED_ORIGIN is not defined in environment variables!");
-    process.exit(1); // Impede o servidor de iniciar sem essa configuração crucial
+if (!MONGO_URI || !DB_NAME || !CORS_ALLOWED_ORIGIN || !FRONTEND_DASHBOARD_REDIRECT_URL || !JWT_SECRET || !DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET || !DISCORD_REDIRECT_URI) {
+    console.error("FATAL ERROR: Uma ou mais variáveis de ambiente CRÍTICAS não estão definidas!");
+    console.log({
+        MONGO_URI_DEFINED: !!MONGO_URI,
+        DB_NAME_DEFINED: !!DB_NAME,
+        CORS_ALLOWED_ORIGIN_DEFINED: !!CORS_ALLOWED_ORIGIN,
+        FRONTEND_DASHBOARD_REDIRECT_URL_DEFINED: !!FRONTEND_DASHBOARD_REDIRECT_URL,
+        JWT_SECRET_DEFINED: !!JWT_SECRET,
+        DISCORD_CLIENT_ID_DEFINED: !!DISCORD_CLIENT_ID,
+        DISCORD_CLIENT_SECRET_DEFINED: !!DISCORD_CLIENT_SECRET,
+        DISCORD_REDIRECT_URI_DEFINED: !!DISCORD_REDIRECT_URI
+    });
+    process.exit(1); // Impede o servidor de iniciar sem essas configurações cruciais
 }
-if (!FRONTEND_DASHBOARD_REDIRECT_URL) {
-    console.error("FATAL ERROR: FRONTEND_DASHBOARD_REDIRECT_URL is not defined in environment variables!");
-    process.exit(1);
-}
-if (!JWT_SECRET) {
-    console.error("FATAL ERROR: JWT_SECRET is not defined in environment variables!");
-    process.exit(1);
-}
-if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET || !DISCORD_REDIRECT_URI) {
-    console.error("FATAL ERROR: Discord OAuth2 environment variables (CLIENT_ID, CLIENT_SECRET, REDIRECT_URI) are not fully defined!");
-    process.exit(1);
-}
-
 
 // --- Middlewares ---
 app.use(cors({
@@ -72,54 +69,91 @@ MongoClient.connect(MONGO_URI)
 
 // --- Funções Auxiliares de Conversão de Tipos BSON ---
 function convertBsonTypeToString(value) {
-    if (!value && typeof value !== 'number') return value;
-    if (value && value.$numberLong && typeof value.$numberLong === 'string') return value.$numberLong;
-    if (value && typeof value === 'object' && value._bsontype === 'Long' && typeof value.toString === 'function') return value.toString();
-    if (typeof value === 'number' || typeof value === 'string') return value.toString();
-    return value;
+    if (!value && typeof value !== 'number') return value; // Permite 0 mas não null/undefined
+    if (value && value.$numberLong && typeof value.$numberLong === 'string') {
+        return value.$numberLong;
+    } else if (value && typeof value === 'object' && value._bsontype === 'Long' && typeof value.toString === 'function') {
+        return value.toString();
+    } else if (typeof value === 'number' || typeof value === 'string') {
+        return value.toString();
+    }
+    return value; // Fallback
 }
 
 function convertBsonDateToTimestamp(value) {
     if (!value) return value;
     if (value && typeof value === 'object' && value.$date) {
-        if (value.$date.$numberLong && typeof value.$date.$numberLong === 'string') return parseInt(value.$date.$numberLong, 10);
-        if (typeof value.$date === 'string') return new Date(value.$date).getTime();
+        if (value.$date.$numberLong && typeof value.$date.$numberLong === 'string') {
+            return parseInt(value.$date.$numberLong, 10);
+        } else if (typeof value.$date === 'string') {
+            // Tenta converter string ISO para timestamp. Se falhar, pode retornar NaN.
+            const parsedDate = new Date(value.$date);
+            return !isNaN(parsedDate.getTime()) ? parsedDate.getTime() : value.$date; // Retorna string original se falhar
+        }
+    } else if (value instanceof Date) { // Se já for um objeto Date do driver MongoDB
+        return value.getTime();
     }
-    if (value instanceof Date) return value.getTime();
-    return value;
+    return value; // Fallback
 }
 
 function convertUserDocument(doc) {
     if (!doc) return doc;
-    const newDoc = { ...doc };
-    if (newDoc._id && typeof newDoc._id.toString === 'function') newDoc._id = newDoc._id.toString();
-    if (newDoc.user_id) newDoc.user_id = convertBsonTypeToString(newDoc.user_id);
+    const newDoc = { ...doc }; // Shallow copy
+
+    if (newDoc._id && typeof newDoc._id.toString === 'function') {
+        newDoc._id = newDoc._id.toString();
+    }
+    if (newDoc.user_id) {
+        newDoc.user_id = convertBsonTypeToString(newDoc.user_id);
+    }
+
     if (newDoc.servers && Array.isArray(newDoc.servers)) {
         newDoc.servers = newDoc.servers.map(server => {
             const newServer = { ...server };
-            if (newServer.guild_id) newServer.guild_id = convertBsonTypeToString(newServer.guild_id);
-            if (newServer.first_message_at) newServer.first_message_at = convertBsonDateToTimestamp(newServer.first_message_at);
-            if (newServer.last_message_at) newServer.last_message_at = convertBsonDateToTimestamp(newServer.last_message_at);
+            if (newServer.guild_id) {
+                newServer.guild_id = convertBsonTypeToString(newServer.guild_id);
+            }
+            if (newServer.first_message_at) {
+                newServer.first_message_at = convertBsonDateToTimestamp(newServer.first_message_at);
+            }
+            if (newServer.last_message_at) {
+                newServer.last_message_at = convertBsonDateToTimestamp(newServer.last_message_at);
+            }
             return newServer;
         });
     }
+
     if (newDoc.history && Array.isArray(newDoc.history)) {
         newDoc.history = newDoc.history.map(histEntry => {
             const newHistEntry = { ...histEntry };
-            if (newHistEntry.changed_at) newHistEntry.changed_at = convertBsonDateToTimestamp(newHistEntry.changed_at);
+            if (newHistEntry.changed_at) {
+                newHistEntry.changed_at = convertBsonDateToTimestamp(newHistEntry.changed_at);
+            }
             const serverChangeKey = newHistEntry.changes && newHistEntry.changes.server_joined ? 'server_joined' : (newHistEntry.changes && newHistEntry.changes.server ? 'server' : null);
             if (serverChangeKey && newHistEntry.changes[serverChangeKey]) {
                 const serverChangeData = { ...newHistEntry.changes[serverChangeKey] };
-                if (serverChangeData.guild_id) serverChangeData.guild_id = convertBsonTypeToString(serverChangeData.guild_id);
-                if (serverChangeData.first_seen) serverChangeData.first_seen = convertBsonDateToTimestamp(serverChangeData.first_seen);
-                if (serverChangeData.first_message_at) serverChangeData.first_message_at = convertBsonDateToTimestamp(serverChangeData.first_message_at);
+                if (serverChangeData.guild_id) {
+                    serverChangeData.guild_id = convertBsonTypeToString(serverChangeData.guild_id);
+                }
+                if (serverChangeData.first_seen) {
+                    serverChangeData.first_seen = convertBsonDateToTimestamp(serverChangeData.first_seen);
+                }
+                if (serverChangeData.first_message_at) {
+                    serverChangeData.first_message_at = convertBsonDateToTimestamp(serverChangeData.first_message_at);
+                }
                 newHistEntry.changes[serverChangeKey] = serverChangeData;
             }
             return newHistEntry;
         });
     }
-    if (newDoc.first_seen_overall_at) newDoc.first_seen_overall_at = convertBsonDateToTimestamp(newDoc.first_seen_overall_at);
-    if (newDoc.last_seen_overall_at) newDoc.last_seen_overall_at = convertBsonDateToTimestamp(newDoc.last_seen_overall_at);
+
+    if (newDoc.first_seen_overall_at) {
+        newDoc.first_seen_overall_at = convertBsonDateToTimestamp(newDoc.first_seen_overall_at);
+    }
+    if (newDoc.last_seen_overall_at) {
+        newDoc.last_seen_overall_at = convertBsonDateToTimestamp(newDoc.last_seen_overall_at);
+    }
+
     if (newDoc.recent_messages && Array.isArray(newDoc.recent_messages)) {
         newDoc.recent_messages = newDoc.recent_messages.map(msg => {
             const newMsg = { ...msg };
@@ -143,7 +177,7 @@ function convertUserDocument(doc) {
 
 // --- Rotas de Autenticação com Discord ---
 app.get('/auth/discord', (req, res) => {
-    const scopes = ['identify', 'email'].join(' ');
+    const scopes = ['identify', 'email'].join(' '); // 'guilds' é opcional se você precisar verificar servidores
     const discordAuthUrl = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(DISCORD_REDIRECT_URI)}&response_type=code&scope=${encodeURIComponent(scopes)}`;
     res.redirect(discordAuthUrl);
 });
@@ -167,22 +201,28 @@ app.get('/auth/discord/callback', async (req, res) => {
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         });
         const accessToken = tokenResponse.data.access_token;
+
         const userResponse = await axios.get('https://discord.com/api/users/@me', {
             headers: { Authorization: `Bearer ${accessToken}` },
         });
         const discordUser = userResponse.data;
         const discordId = discordUser.id;
-        let userRole = 'free';
-        if (ADMIN_DISCORD_IDS.includes(discordId)) userRole = 'admin';
-        else if (PREMIUM_DISCORD_IDS.includes(discordId)) userRole = 'premium';
 
+        let userRole = 'free';
+        if (ADMIN_DISCORD_IDS.includes(discordId)) {
+            userRole = 'admin';
+        } else if (PREMIUM_DISCORD_IDS.includes(discordId)) {
+            userRole = 'premium';
+        }
+        
         const appTokenPayload = {
             discordId: discordId,
             username: discordUser.username,
+            // Gera URL do avatar. Se não tiver avatar, usa um padrão do Discord.
             avatar: discordUser.avatar ? `https://cdn.discordapp.com/avatars/${discordId}/${discordUser.avatar}.png` : `https://cdn.discordapp.com/embed/avatars/${parseInt(discordUser.discriminator, 10) % 5}.png`,
             role: userRole,
         };
-        const appToken = jwt.sign(appTokenPayload, JWT_SECRET, { expiresIn: '7d' });
+        const appToken = jwt.sign(appTokenPayload, JWT_SECRET, { expiresIn: '7d' }); // Token expira em 7 dias
 
         const targetUrl = new URL(FRONTEND_DASHBOARD_REDIRECT_URL);
         targetUrl.searchParams.set('token', appToken);
@@ -214,8 +254,20 @@ const requireAuth = (req, res, next) => {
     }
 };
 
+// --- Middleware de Verificação de Função (Role) ---
+const checkRole = (requiredRole) => {
+    return (req, res, next) => {
+        // Este middleware deve rodar DEPOIS do requireAuth, então req.user deve existir
+        if (!req.user || req.user.role !== requiredRole) {
+            return res.status(403).json({ error: 'Acesso proibido: Função inadequada para este recurso.' });
+        }
+        next();
+    };
+};
+
 // --- Rota para obter dados do usuário logado ---
 app.get('/auth/me', requireAuth, (req, res) => {
+    // req.user foi populado pelo middleware requireAuth
     res.json({
         discordId: req.user.discordId,
         username: req.user.username,
@@ -229,9 +281,7 @@ app.get('/', (req, res) => {
     res.json({ message: "Bem-vindo à API do Celestial Tracker. Use /auth/discord para login." });
 });
 
-// As rotas abaixo agora usam o middleware requireAuth
-// Se precisar testá-las sem login durante o desenvolvimento inicial do frontend,
-// você pode temporariamente comentar a chamada para 'requireAuth'.
+// Rotas de dados de usuários rastreados (agora protegidas)
 app.get('/users', requireAuth, async (req, res) => {
     if (!usersCollection) return res.status(503).json({ error: "Serviço indisponível: MongoDB não conectado." });
     try {
@@ -286,6 +336,70 @@ app.get('/users/:userIdStr/history/nicknames', requireAuth, async (req, res) => 
             return res.status(400).json({ error: `ID de usuário (tracker) inválido na URL: '${userIdStr}'.` });
         }
         res.status(500).json({ error: "Erro interno ao buscar histórico de nomes.", details: error.message });
+    }
+});
+
+// --- Rotas do Painel Admin ---
+app.get('/admin/stats', requireAuth, checkRole('admin'), async (req, res) => {
+    if (!usersCollection) return res.status(503).json({ error: "Serviço indisponível" });
+    try {
+        const totalTrackedUsers = await usersCollection.countDocuments();
+        const imageStats = await usersCollection.aggregate([
+            { $match: { message_image_history: { $exists: true, $ne: [] } } }, // Apenas docs com o array existente e não vazio
+            { $project: { numImages: { $size: "$message_image_history" } } },
+            { $group: { _id: null, totalMessageImages: { $sum: "$numImages" } } }
+        ]).toArray();
+        const totalMessageImages = imageStats.length > 0 ? imageStats[0].totalMessageImages : 0;
+        res.json({ totalTrackedUsers, totalMessageImages });
+    } catch (error) {
+        console.error("Erro em /admin/stats:", error);
+        res.status(500).json({ error: "Erro interno ao buscar estatísticas.", details: error.message });
+    }
+});
+
+app.get('/admin/roles/config', requireAuth, checkRole('admin'), (req, res) => {
+    res.json({ adminIds: ADMIN_DISCORD_IDS, premiumIds: PREMIUM_DISCORD_IDS });
+});
+
+app.get('/admin/users/filter', requireAuth, checkRole('admin'), async (req, res) => {
+    if (!usersCollection) return res.status(503).json({ error: "Serviço indisponível" });
+    try {
+        const { hasMessageImages, hasAvatarHistory, usernameContains, discordId } = req.query;
+        let mongoQuery = {};
+        const queryParts = []; // Usar $and explicitamente se múltiplos campos são opcionais
+
+        if (hasMessageImages === 'true') {
+            queryParts.push({ message_image_history: { $exists: true, $not: { $size: 0 } } });
+        }
+        if (hasAvatarHistory === 'true') {
+            queryParts.push({ avatar_url_history: { $exists: true, $not: { $size: 0 } } });
+        }
+        if (usernameContains) {
+            const regex = { $regex: usernameContains, $options: 'i' };
+            queryParts.push({ $or: [{ current_username_global: regex }, { username_global_history: regex }] });
+        }
+        if (discordId) { // Assumindo que 'discordId' no filtro refere-se ao 'user_id' (tracker ID)
+            try {
+                queryParts.push({ user_id: Long.fromString(discordId) });
+            } catch (e) {
+                return res.status(400).json({ error: "Formato de ID (para user_id do tracker) inválido."});
+            }
+        }
+
+        if (queryParts.length > 0) {
+            mongoQuery = { $and: queryParts };
+        } else {
+             // Se nenhum filtro for fornecido, você pode retornar todos ou um erro/lista vazia.
+             // Para este exemplo, retornaremos todos os usuários (limitado).
+        }
+
+        console.log("[Admin Filter] Query MongoDB:", JSON.stringify(mongoQuery));
+        const users = await usersCollection.find(mongoQuery).limit(100).sort({last_seen_overall_at: -1}).toArray();
+        res.json(users.map(user => convertUserDocument(user)));
+
+    } catch (error) {
+        console.error("Erro em /admin/users/filter:", error);
+        res.status(500).json({ error: "Erro interno ao filtrar usuários.", details: error.message });
     }
 });
 
