@@ -1,4 +1,4 @@
-// server.js (Backend API - Completo com Discord OAuth2, JWT e rota /auth/me)
+// server.js (Backend API - Completo com Discord OAuth2, JWT, /auth/me e proteção de rotas)
 require('dotenv').config();
 
 const express = require('express');
@@ -17,19 +17,45 @@ const PORT = process.env.PORT || 3000;
 
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
-const DISCORD_REDIRECT_URI = process.env.DISCORD_REDIRECT_URI;
+const DISCORD_REDIRECT_URI = process.env.DISCORD_REDIRECT_URI; // URI de callback da API
 const JWT_SECRET = process.env.JWT_SECRET;
-const FRONTEND_URL = process.env.FRONTEND_URL;
+
+const CORS_ALLOWED_ORIGIN = process.env.CORS_ALLOWED_ORIGIN; // Ex: https://jesusdiscordjs.github.io
+const FRONTEND_DASHBOARD_REDIRECT_URL = process.env.FRONTEND_DASHBOARD_REDIRECT_URL; // Ex: https://jesusdiscordjs.github.io/Celestial/dashboard.html
 
 const ADMIN_DISCORD_IDS = (process.env.ADMIN_DISCORD_IDS || "").split(',').map(id => id.trim()).filter(id => id);
 const PREMIUM_DISCORD_IDS = (process.env.PREMIUM_DISCORD_IDS || "").split(',').map(id => id.trim()).filter(id => id);
 
 const app = express();
 
-app.use(cors({ origin: FRONTEND_URL, credentials: true }));
+// --- Validação Crítica de Variáveis de Ambiente ---
+if (!CORS_ALLOWED_ORIGIN) {
+    console.error("FATAL ERROR: CORS_ALLOWED_ORIGIN is not defined in environment variables!");
+    process.exit(1); // Impede o servidor de iniciar sem essa configuração crucial
+}
+if (!FRONTEND_DASHBOARD_REDIRECT_URL) {
+    console.error("FATAL ERROR: FRONTEND_DASHBOARD_REDIRECT_URL is not defined in environment variables!");
+    process.exit(1);
+}
+if (!JWT_SECRET) {
+    console.error("FATAL ERROR: JWT_SECRET is not defined in environment variables!");
+    process.exit(1);
+}
+if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET || !DISCORD_REDIRECT_URI) {
+    console.error("FATAL ERROR: Discord OAuth2 environment variables (CLIENT_ID, CLIENT_SECRET, REDIRECT_URI) are not fully defined!");
+    process.exit(1);
+}
+
+
+// --- Middlewares ---
+app.use(cors({
+    origin: CORS_ALLOWED_ORIGIN,
+    credentials: true
+}));
 app.use(express.json());
 app.use(cookieParser());
 
+// --- Conexão com o MongoDB ---
 let db;
 let usersCollection;
 
@@ -44,7 +70,7 @@ MongoClient.connect(MONGO_URI)
         process.exit(1);
     });
 
-// --- Funções Auxiliares de Conversão de Tipos BSON (como na resposta anterior) ---
+// --- Funções Auxiliares de Conversão de Tipos BSON ---
 function convertBsonTypeToString(value) {
     if (!value && typeof value !== 'number') return value;
     if (value && value.$numberLong && typeof value.$numberLong === 'string') return value.$numberLong;
@@ -52,6 +78,7 @@ function convertBsonTypeToString(value) {
     if (typeof value === 'number' || typeof value === 'string') return value.toString();
     return value;
 }
+
 function convertBsonDateToTimestamp(value) {
     if (!value) return value;
     if (value && typeof value === 'object' && value.$date) {
@@ -61,6 +88,7 @@ function convertBsonDateToTimestamp(value) {
     if (value instanceof Date) return value.getTime();
     return value;
 }
+
 function convertUserDocument(doc) {
     if (!doc) return doc;
     const newDoc = { ...doc };
@@ -115,7 +143,7 @@ function convertUserDocument(doc) {
 
 // --- Rotas de Autenticação com Discord ---
 app.get('/auth/discord', (req, res) => {
-    const scopes = ['identify', 'email'].join(' '); // 'guilds' é opcional
+    const scopes = ['identify', 'email'].join(' ');
     const discordAuthUrl = `https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(DISCORD_REDIRECT_URI)}&response_type=code&scope=${encodeURIComponent(scopes)}`;
     res.redirect(discordAuthUrl);
 });
@@ -123,7 +151,9 @@ app.get('/auth/discord', (req, res) => {
 app.get('/auth/discord/callback', async (req, res) => {
     const code = req.query.code;
     if (!code) {
-        return res.redirect(`${FRONTEND_URL}/dashboard.html?error=discord_auth_denied`);
+        const targetUrl = new URL(FRONTEND_DASHBOARD_REDIRECT_URL);
+        targetUrl.searchParams.set('error', 'discord_auth_denied');
+        return res.redirect(targetUrl.toString());
     }
     try {
         const tokenResponse = await axios.post('https://discord.com/api/oauth2/token',
@@ -149,14 +179,20 @@ app.get('/auth/discord/callback', async (req, res) => {
         const appTokenPayload = {
             discordId: discordId,
             username: discordUser.username,
-            avatar: discordUser.avatar ? `https://cdn.discordapp.com/avatars/${discordId}/${discordUser.avatar}.png` : `https://cdn.discordapp.com/embed/avatars/${parseInt(discordUser.discriminator, 10) % 5}.png`, // Avatar padrão do Discord
+            avatar: discordUser.avatar ? `https://cdn.discordapp.com/avatars/${discordId}/${discordUser.avatar}.png` : `https://cdn.discordapp.com/embed/avatars/${parseInt(discordUser.discriminator, 10) % 5}.png`,
             role: userRole,
         };
         const appToken = jwt.sign(appTokenPayload, JWT_SECRET, { expiresIn: '7d' });
-        res.redirect(`${FRONTEND_URL}/dashboard.html?token=${appToken}`);
+
+        const targetUrl = new URL(FRONTEND_DASHBOARD_REDIRECT_URL);
+        targetUrl.searchParams.set('token', appToken);
+        res.redirect(targetUrl.toString());
+
     } catch (error) {
         console.error('Erro no callback do Discord OAuth2:', error.response ? error.response.data : error.message);
-        res.redirect(`${FRONTEND_URL}/dashboard.html?error=discord_callback_error`);
+        const targetUrl = new URL(FRONTEND_DASHBOARD_REDIRECT_URL);
+        targetUrl.searchParams.set('error', 'discord_callback_error');
+        res.redirect(targetUrl.toString());
     }
 });
 
@@ -180,8 +216,6 @@ const requireAuth = (req, res, next) => {
 
 // --- Rota para obter dados do usuário logado ---
 app.get('/auth/me', requireAuth, (req, res) => {
-    // req.user foi populado pelo middleware requireAuth
-    // Retornamos apenas os dados seguros do payload do token
     res.json({
         discordId: req.user.discordId,
         username: req.user.username,
@@ -190,25 +224,28 @@ app.get('/auth/me', requireAuth, (req, res) => {
     });
 });
 
-// --- Rotas da API (agora algumas podem ser protegidas) ---
+// --- Rotas da API ---
 app.get('/', (req, res) => {
     res.json({ message: "Bem-vindo à API do Celestial Tracker. Use /auth/discord para login." });
 });
 
+// As rotas abaixo agora usam o middleware requireAuth
+// Se precisar testá-las sem login durante o desenvolvimento inicial do frontend,
+// você pode temporariamente comentar a chamada para 'requireAuth'.
 app.get('/users', requireAuth, async (req, res) => {
-    if (!usersCollection) return res.status(503).json({ error: "Serviço indisponível" });
+    if (!usersCollection) return res.status(503).json({ error: "Serviço indisponível: MongoDB não conectado." });
     try {
         const usersArray = await usersCollection.find().toArray();
         const simplifiedUsers = usersArray.map(user => convertUserDocument(user));
         res.json(simplifiedUsers);
     } catch (error) {
         console.error("Erro ao buscar usuários:", error);
-        res.status(500).json({ error: "Erro interno", details: error.message });
+        res.status(500).json({ error: "Erro interno ao buscar usuários.", details: error.message });
     }
 });
 
 app.get('/users/:userIdStr', requireAuth, async (req, res) => {
-    if (!usersCollection) return res.status(503).json({ error: "Serviço indisponível" });
+    if (!usersCollection) return res.status(503).json({ error: "Serviço indisponível: MongoDB não conectado." });
     const userIdStr = req.params.userIdStr;
     try {
         const userIdQuery = Long.fromString(userIdStr);
@@ -216,17 +253,19 @@ app.get('/users/:userIdStr', requireAuth, async (req, res) => {
         if (user) {
             res.json(convertUserDocument(user));
         } else {
-            res.status(404).json({ error: `Usuário '${userIdStr}' não encontrado.` });
+            res.status(404).json({ error: `Usuário com ID (tracker) '${userIdStr}' não encontrado.` });
         }
     } catch (error) {
         console.error(`Erro ao buscar usuário ${userIdStr}:`, error);
-        if (error.message.includes("Long")) return res.status(400).json({ error: `ID inválido: '${userIdStr}'.` });
-        res.status(500).json({ error: "Erro interno", details: error.message });
+        if (error.message && (error.message.includes("is not a valid string representation of a Long") || error.message.toLowerCase().includes("out of range") || error.message.toLowerCase().includes("non-hex character"))) {
+             return res.status(400).json({ error: `ID de usuário (tracker) inválido na URL: '${userIdStr}'.` });
+        }
+        res.status(500).json({ error: "Erro interno ao buscar usuário.", details: error.message });
     }
 });
 
 app.get('/users/:userIdStr/history/nicknames', requireAuth, async (req, res) => {
-    if (!usersCollection) return res.status(503).json({ error: "Serviço indisponível" });
+    if (!usersCollection) return res.status(503).json({ error: "Serviço indisponível: MongoDB não conectado." });
     const userIdStr = req.params.userIdStr;
     try {
         const userIdQuery = Long.fromString(userIdStr);
@@ -239,21 +278,25 @@ app.get('/users/:userIdStr/history/nicknames', requireAuth, async (req, res) => 
                 username_global_history: userFromDb.username_global_history || []
             });
         } else {
-            res.status(404).json({ error: `Usuário '${userIdStr}' não encontrado.` });
+            res.status(404).json({ error: `Usuário com ID (tracker) '${userIdStr}' não encontrado para histórico de nomes.` });
         }
     } catch (error) {
-        console.error(`Erro nomes ${userIdStr}:`, error);
-        if (error.message.includes("Long")) return res.status(400).json({ error: `ID inválido: '${userIdStr}'.` });
-        res.status(500).json({ error: "Erro interno", details: error.message });
+        console.error(`Erro ao buscar histórico de nomes para ${userIdStr}:`, error);
+        if (error.message && (error.message.includes("is not a valid string representation of a Long") || error.message.toLowerCase().includes("out of range") || error.message.toLowerCase().includes("non-hex character"))) {
+            return res.status(400).json({ error: `ID de usuário (tracker) inválido na URL: '${userIdStr}'.` });
+        }
+        res.status(500).json({ error: "Erro interno ao buscar histórico de nomes.", details: error.message });
     }
 });
+
 
 // --- Iniciar o Servidor ---
 app.listen(PORT, () => {
     console.log(`🚀 Servidor API rodando na porta ${PORT} (http://localhost:${PORT})`);
     if (process.env.RENDER_EXTERNAL_URL) console.log(`🔗 Deploy no Render: ${process.env.RENDER_EXTERNAL_URL}`);
-    console.log(`🔑 Admin IDs: ${ADMIN_DISCORD_IDS.join(', ') || 'Nenhum'}`);
-    console.log(`⭐ Premium IDs: ${PREMIUM_DISCORD_IDS.join(', ') || 'Nenhum'}`);
-    console.log(`🔗 Frontend URL: ${FRONTEND_URL}`);
-    console.log(`🔗 Discord Redirect URI: ${DISCORD_REDIRECT_URI}`);
+    console.log(`🔒 CORS permitido para origem: ${CORS_ALLOWED_ORIGIN}`);
+    console.log(`↪️  Frontend Redirect Dashboard URL: ${FRONTEND_DASHBOARD_REDIRECT_URL}`);
+    console.log(`🔑 Admin IDs: ${ADMIN_DISCORD_IDS.join(', ') || 'Nenhum configurado'}`);
+    console.log(`⭐ Premium IDs: ${PREMIUM_DISCORD_IDS.join(', ') || 'Nenhum configurado'}`);
+    console.log(`🔗 Discord API Redirect URI (callback da API): ${DISCORD_REDIRECT_URI}`);
 });
